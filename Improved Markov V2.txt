@@ -1,0 +1,64 @@
+import pandas as pd
+import numpy as np
+from hmmlearn import hmm
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from itertools import groupby
+
+# Load dataset (Assuming the dataset is in a CSV file)
+file_path = "your_dataset.csv"  # Change this to your actual file path
+df = pd.read_csv(file_path)
+
+# Encode KeyPressed into numerical values
+label_encoder = LabelEncoder()
+df['KeyEncoded'] = label_encoder.fit_transform(df['KeyPressed'])
+
+# Select timing features
+features = ['FlightTime', 'KeyHoldTime']
+df[features] = df[features].fillna(0)  # Handle missing values
+scaler = StandardScaler()
+df[features] = scaler.fit_transform(df[features])
+
+# Function to train HMM per user and extract features
+def train_hmm_per_user(user_df):
+    X = user_df[['KeyEncoded'] + features].values
+    lengths = [len(X)]
+    
+    hmm_model = hmm.GaussianHMM(n_components=4, covariance_type="diag", n_iter=1000, random_state=42)
+    hmm_model.fit(X, lengths)
+    
+    log_likelihood = hmm_model.score(X)
+    hidden_states = hmm_model.predict(X)
+    
+    user_df['HMM_LogLikelihood_PerUser'] = log_likelihood
+    user_df['HMM_HiddenState'] = hidden_states
+    
+    # Calculate state transition counts
+    transitions = np.bincount(hidden_states[:-1] * 4 + hidden_states[1:], minlength=16)
+    user_df['HMM_HiddenState_TransitionCount'] = sum(transitions > 0)
+    
+    # Calculate state duration (how long each state lasts)
+    state_durations = [sum(1 for _ in group) for key, group in groupby(hidden_states)]
+    user_df['HMM_HiddenState_Duration'] = np.mean(state_durations) if state_durations else 0
+    
+    return user_df
+
+# Apply per user
+df = df.groupby('DeviceId', group_keys=False).apply(train_hmm_per_user)
+
+# Additional derived features
+df['TypingSpeed'] = 1 / (df['FlightTime'].replace(0, np.nan))
+df['KeySequenceChangeRate'] = df['HMM_HiddenState_TransitionCount'] / df.groupby('DeviceId')['HMM_HiddenState_TransitionCount'].transform('sum')
+
+df['InterKeyInterval_Mean'] = df.groupby('DeviceId')['FlightTime'].transform('mean')
+df['InterKeyInterval_Std'] = df.groupby('DeviceId')['FlightTime'].transform('std')
+df['Burstiness'] = df.groupby('DeviceId')['FlightTime'].transform(lambda x: (x.std() - x.mean()) / (x.std() + x.mean()))
+
+df['TransitionEntropy'] = df.groupby('DeviceId')['HMM_HiddenState'].transform(lambda x: -np.sum(np.bincount(x, minlength=4) / len(x) * np.log2(np.bincount(x, minlength=4) / len(x))))
+df['DominantHiddenState'] = df.groupby('DeviceId')['HMM_HiddenState'].transform(lambda x: np.bincount(x).argmax())
+
+df['TimeSinceLastKeyPress'] = df.groupby('DeviceId')['FlightTime'].transform(lambda x: x.shift(1).fillna(0).cumsum())
+df['AvgSessionLength'] = df.groupby('DeviceId')['FlightTime'].transform(lambda x: (x > 2 * x.mean()).cumsum().value_counts().mean())
+
+# Save enhanced dataset
+df.to_csv("enhanced_dataset.csv", index=False)
+print("Feature extraction complete. Saved to enhanced_dataset.csv")
